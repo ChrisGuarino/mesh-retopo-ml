@@ -1,0 +1,8 @@
+trimesh
+numpy
+matplotlib
+scipy
+networkx
+pyfqmr
+"pyglet<2"
+torch
