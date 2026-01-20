@@ -16,6 +16,7 @@ Input Mesh → Feature Extraction → ML Importance Prediction → Adaptive Simp
 
 - **11 geometric features** extracted per face (curvature, area, angles, topology)
 - **MLP-based importance prediction** (~3,600 parameters, trains in seconds)
+- **Thingi10K dataset support** for training on real-world meshes
 - **Synthetic dataset generation** (organic + hard surface primitives)
 - **Comparison tools** to evaluate ML-guided vs standard simplification
 
@@ -31,18 +32,37 @@ pip install -r requirements.txt
 
 ## Quick Start
 
+### Option 1: Synthetic Data Only
 ```bash
-# 1. Generate training data
+# Generate training data from synthetic primitives
 python dataset_generator.py --num_meshes 100 --output data/
 
-# 2. Train the model
+# Train the model
 python train.py --data data/training_data.npz --epochs 50 --output models/importance_v1.pt
+```
 
-# 3. Simplify a mesh
+### Option 2: With Thingi10K (Recommended)
+```bash
+# Download Thingi10K from: https://ten-thousand-models.appspot.com/
+# Extract to datasets/thingi10k/
+
+# Generate training data (70% real meshes, 30% synthetic)
+python dataset_generator.py --num_meshes 200 --thingi10k datasets/thingi10k --output data/
+
+# Train the model
+python train.py --data data/training_data.npz --epochs 50 --output models/importance_v1.pt
+```
+
+### Run Simplification
+```bash
+# Simplify a mesh
 python adaptive_simplify.py --mesh your_mesh.stl --model models/importance_v1.pt --target 1000 --output simplified.ply
 
-# 4. Compare ML vs standard simplification
+# Compare ML vs standard simplification
 python adaptive_simplify.py --mesh your_mesh.stl --model models/importance_v1.pt --target 500 --compare
+
+# Visualize importance as vertex colors
+python adaptive_simplify.py --mesh your_mesh.stl --model models/importance_v1.pt --target 500 --visualize --output importance.ply
 ```
 
 ## Project Structure
@@ -50,7 +70,7 @@ python adaptive_simplify.py --mesh your_mesh.stl --model models/importance_v1.pt
 ```
 mesh-retopo-ml/
 ├── feature_extractor.py    # Extract 11 geometric features per face
-├── dataset_generator.py    # Generate synthetic training pairs
+├── dataset_generator.py    # Generate training pairs (synthetic + Thingi10K)
 ├── importance_model.py     # MLP neural network definition
 ├── train.py                # Training script
 ├── adaptive_simplify.py    # ML-guided mesh simplification
@@ -58,6 +78,14 @@ mesh-retopo-ml/
 ├── PLAN.md                 # Development roadmap
 └── requirements.txt        # Dependencies
 ```
+
+## Dataset Options
+
+| Source | Command | Description |
+|--------|---------|-------------|
+| Synthetic only | `--num_meshes 100` | Fast, limited variety |
+| Thingi10K | `--thingi10k PATH` | Real-world 3D printable objects |
+| Mixed (default) | `--thingi10k PATH --thingi10k_ratio 0.7` | 70% real, 30% synthetic |
 
 ## How It Works
 
@@ -80,8 +108,8 @@ For each face, we compute:
 
 ### Training Pipeline
 
-1. **Generate meshes** - Synthetic primitives (spheres, tori, boxes, cylinders)
-2. **Simplify each mesh** - Using standard QEM at various ratios
+1. **Load meshes** - From Thingi10K and/or synthetic primitives
+2. **Simplify each mesh** - Using standard QEM at various ratios (10%, 20%, 30%, 50%)
 3. **Label faces** - Importance based on proximity to simplified mesh
 4. **Train MLP** - Learn mapping from features → importance score
 

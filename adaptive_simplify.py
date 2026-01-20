@@ -276,7 +276,7 @@ def main():
     parser = argparse.ArgumentParser(description="ML-guided mesh simplification")
     parser.add_argument("--mesh", type=str, required=True,
                         help="Path to input mesh")
-    parser.add_argument("--model", type=str, default="models/importance_v1.pt",
+    parser.add_argument("--model", type=str, default="models/importance_v3.pt",
                         help="Path to trained model")
     parser.add_argument("--target", type=int, required=True,
                         help="Target number of faces")
