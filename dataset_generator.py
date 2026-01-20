@@ -1,31 +1,181 @@
 """
 Dataset Generator for Mesh Retopology ML
 
-Generates synthetic training pairs:
-- High-poly meshes with various geometries (organic + hard surface)
-- Ground truth simplifications
-- Per-face importance labels based on which faces survive simplification
+Supports multiple data sources:
+- Thingi10K dataset (real-world 3D printable objects)
+- Synthetic primitives (fallback)
+
+Generates training pairs with per-face importance labels.
 """
 
 import numpy as np
 import trimesh
 from pathlib import Path
 import argparse
+import zipfile
+import urllib.request
+import os
+import random
 from feature_extractor import FeatureExtractor
 
 
-class DatasetGenerator:
-    """Generate synthetic mesh pairs for training importance prediction."""
+class Thingi10KLoader:
+    """Load meshes from the Thingi10K dataset."""
 
-    def __init__(self, output_dir="data"):
+    DOWNLOAD_URL = "https://ten-thousand-models.appspot.com/api/v1/model/{}/download"
+    MANIFEST_URL = "https://ten-thousand-models.appspot.com/api/v1/models"
+
+    def __init__(self, data_dir="datasets/thingi10k"):
+        """
+        Initialize the loader.
+
+        Args:
+            data_dir: Directory to store downloaded meshes
+        """
+        self.data_dir = Path(data_dir)
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.mesh_files = []
+        self._scan_existing()
+
+    def _scan_existing(self):
+        """Scan for already downloaded mesh files."""
+        extensions = ['.stl', '.obj', '.ply', '.off']
+        for ext in extensions:
+            self.mesh_files.extend(list(self.data_dir.rglob(f'*{ext}')))
+        print(f"Found {len(self.mesh_files)} existing meshes in {self.data_dir}")
+
+    def download_sample(self, num_meshes=100):
+        """
+        Download a sample of meshes from Thingi10K.
+
+        Note: This downloads individual models. For bulk download,
+        use the official Thingi10K dataset from:
+        https://ten-thousand-models.appspot.com/
+
+        Args:
+            num_meshes: Number of meshes to download
+        """
+        print(f"Attempting to download {num_meshes} meshes from Thingi10K...")
+        print("Note: For best results, download the full dataset manually from:")
+        print("https://ten-thousand-models.appspot.com/")
+        print(f"And extract to: {self.data_dir}")
+
+        # Try to download a few sample models
+        # Model IDs in Thingi10K range roughly from 1 to 10000
+        downloaded = 0
+        attempts = 0
+        max_attempts = num_meshes * 3
+
+        while downloaded < num_meshes and attempts < max_attempts:
+            model_id = random.randint(1, 10000)
+            attempts += 1
+
+            try:
+                output_path = self.data_dir / f"model_{model_id}.stl"
+                if output_path.exists():
+                    continue
+
+                url = self.DOWNLOAD_URL.format(model_id)
+                urllib.request.urlretrieve(url, output_path)
+
+                # Verify it's a valid mesh
+                mesh = trimesh.load(output_path)
+                if hasattr(mesh, 'faces') and len(mesh.faces) > 100:
+                    self.mesh_files.append(output_path)
+                    downloaded += 1
+                    if downloaded % 10 == 0:
+                        print(f"  Downloaded {downloaded}/{num_meshes}")
+                else:
+                    output_path.unlink()  # Remove invalid file
+
+            except Exception as e:
+                continue
+
+        print(f"Downloaded {downloaded} meshes")
+
+    def load_from_directory(self, directory):
+        """
+        Load meshes from a directory (e.g., manually downloaded Thingi10K).
+
+        Args:
+            directory: Path to directory containing mesh files
+        """
+        directory = Path(directory)
+        extensions = ['.stl', '.obj', '.ply', '.off', '.STL', '.OBJ', '.PLY']
+
+        for ext in extensions:
+            self.mesh_files.extend(list(directory.rglob(f'*{ext}')))
+
+        # Remove duplicates
+        self.mesh_files = list(set(self.mesh_files))
+        print(f"Found {len(self.mesh_files)} meshes in {directory}")
+
+    def get_meshes(self, count=100, min_faces=500, max_faces=100000):
+        """
+        Load and return meshes.
+
+        Args:
+            count: Number of meshes to return
+            min_faces: Minimum face count filter
+            max_faces: Maximum face count filter
+
+        Returns:
+            List of trimesh.Trimesh objects
+        """
+        if len(self.mesh_files) == 0:
+            print("No mesh files found. Downloading samples...")
+            self.download_sample(count)
+
+        meshes = []
+        random.shuffle(self.mesh_files)
+
+        for mesh_path in self.mesh_files:
+            if len(meshes) >= count:
+                break
+
+            try:
+                mesh = trimesh.load(mesh_path, force='mesh')
+
+                # Handle scenes
+                if isinstance(mesh, trimesh.Scene):
+                    mesh = mesh.dump(concatenate=True)
+
+                # Filter by face count
+                if not hasattr(mesh, 'faces'):
+                    continue
+                if len(mesh.faces) < min_faces or len(mesh.faces) > max_faces:
+                    continue
+
+                # Check mesh validity
+                if not mesh.is_watertight and len(mesh.faces) < min_faces:
+                    continue
+
+                meshes.append(mesh)
+
+            except Exception as e:
+                continue
+
+        print(f"Loaded {len(meshes)} valid meshes")
+        return meshes
+
+
+class DatasetGenerator:
+    """Generate mesh pairs for training importance prediction."""
+
+    def __init__(self, output_dir="data", thingi10k_dir=None):
         """
         Initialize the generator.
 
         Args:
             output_dir: Directory to save generated data
+            thingi10k_dir: Optional path to Thingi10K dataset
         """
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        self.thingi10k_loader = None
+        if thingi10k_dir:
+            self.thingi10k_loader = Thingi10KLoader(thingi10k_dir)
 
     def generate_organic_meshes(self, count=10):
         """
@@ -254,30 +404,50 @@ class DatasetGenerator:
             'target_ratio': target_ratio,
         }
 
-    def generate_dataset(self, num_meshes=100, ratios=[0.1, 0.2, 0.3, 0.5]):
+    def generate_dataset(self, num_meshes=100, ratios=[0.1, 0.2, 0.3, 0.5],
+                         use_thingi10k=False, thingi10k_ratio=0.5):
         """
         Generate a full training dataset.
 
         Args:
-            num_meshes: Total number of unique meshes to generate
+            num_meshes: Total number of unique meshes to use
             ratios: List of simplification ratios to use for each mesh
+            use_thingi10k: Whether to use Thingi10K meshes
+            thingi10k_ratio: Ratio of meshes from Thingi10K (rest synthetic)
 
         Returns:
             List of training samples
         """
         samples = []
+        all_meshes = []
 
-        # Generate mesh types
-        organic_count = num_meshes // 2
-        hard_count = num_meshes - organic_count
+        if use_thingi10k and self.thingi10k_loader:
+            # Load real meshes from Thingi10K
+            thingi_count = int(num_meshes * thingi10k_ratio)
+            synthetic_count = num_meshes - thingi_count
 
-        print(f"Generating {organic_count} organic meshes...")
-        organic_meshes = self.generate_organic_meshes(organic_count)
+            print(f"\nLoading {thingi_count} meshes from Thingi10K...")
+            thingi_meshes = self.thingi10k_loader.get_meshes(count=thingi_count)
+            all_meshes.extend(thingi_meshes)
 
-        print(f"Generating {hard_count} hard surface meshes...")
-        hard_meshes = self.generate_hard_surface_meshes(hard_count)
+            if synthetic_count > 0:
+                print(f"\nGenerating {synthetic_count} synthetic meshes...")
+                organic_count = synthetic_count // 2
+                hard_count = synthetic_count - organic_count
+                all_meshes.extend(self.generate_organic_meshes(organic_count))
+                all_meshes.extend(self.generate_hard_surface_meshes(hard_count))
+        else:
+            # Generate all synthetic meshes
+            organic_count = num_meshes // 2
+            hard_count = num_meshes - organic_count
 
-        all_meshes = organic_meshes + hard_meshes
+            print(f"Generating {organic_count} organic meshes...")
+            organic_meshes = self.generate_organic_meshes(organic_count)
+
+            print(f"Generating {hard_count} hard surface meshes...")
+            hard_meshes = self.generate_hard_surface_meshes(hard_count)
+
+            all_meshes = organic_meshes + hard_meshes
 
         print(f"\nProcessing {len(all_meshes)} meshes with {len(ratios)} ratios each...")
 
@@ -335,27 +505,50 @@ class DatasetGenerator:
 def main():
     parser = argparse.ArgumentParser(description="Generate training dataset for mesh retopology ML")
     parser.add_argument("--num_meshes", type=int, default=100,
-                        help="Number of meshes to generate")
+                        help="Number of meshes to use")
     parser.add_argument("--output", type=str, default="data",
                         help="Output directory")
     parser.add_argument("--ratios", type=float, nargs="+", default=[0.1, 0.2, 0.3, 0.5],
                         help="Simplification ratios to use")
+    parser.add_argument("--thingi10k", type=str, default=None,
+                        help="Path to Thingi10K dataset directory")
+    parser.add_argument("--thingi10k_ratio", type=float, default=0.7,
+                        help="Ratio of meshes from Thingi10K (0-1)")
+    parser.add_argument("--download", action="store_true",
+                        help="Attempt to download Thingi10K samples")
 
     args = parser.parse_args()
 
-    generator = DatasetGenerator(output_dir=args.output)
+    # Setup Thingi10K if specified
+    thingi10k_dir = args.thingi10k
+    use_thingi10k = False
+
+    if args.download:
+        thingi10k_dir = "datasets/thingi10k"
+        use_thingi10k = True
+    elif args.thingi10k:
+        use_thingi10k = True
+
+    generator = DatasetGenerator(output_dir=args.output, thingi10k_dir=thingi10k_dir)
 
     print("=" * 50)
     print("Mesh Retopology ML - Dataset Generator")
     print("=" * 50)
-    print(f"Generating {args.num_meshes} meshes")
+    print(f"Target meshes: {args.num_meshes}")
     print(f"Simplification ratios: {args.ratios}")
     print(f"Output directory: {args.output}")
+    if use_thingi10k:
+        print(f"Thingi10K directory: {thingi10k_dir}")
+        print(f"Thingi10K ratio: {args.thingi10k_ratio:.0%}")
+    else:
+        print("Using synthetic meshes only")
     print("=" * 50)
 
     samples = generator.generate_dataset(
         num_meshes=args.num_meshes,
-        ratios=args.ratios
+        ratios=args.ratios,
+        use_thingi10k=use_thingi10k,
+        thingi10k_ratio=args.thingi10k_ratio
     )
 
     generator.save_dataset(samples)
