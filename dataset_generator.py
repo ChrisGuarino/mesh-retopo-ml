@@ -318,58 +318,94 @@ class DatasetGenerator:
 
         return trimesh.Trimesh(vertices=vertices, faces=mesh.faces)
 
-    def compute_face_importance(self, original_mesh, simplified_mesh):
+    def compute_face_importance(self, mesh):
         """
-        Compute importance labels by checking which regions survive simplification.
+        Compute importance labels based on geometric properties.
 
-        Uses nearest-face mapping to determine if original faces are preserved.
+        This uses curvature, edge sharpness, and surface variation to determine
+        which faces are geometrically important - NOT based on what QEM keeps.
+
+        Important faces have:
+        - High curvature (peaks, valleys, detailed regions)
+        - Sharp dihedral angles (feature edges)
+        - High normal variation (surface detail)
+
+        Unimportant faces have:
+        - Low/flat curvature (planar regions)
+        - Gentle dihedral angles (smooth transitions)
+        - Low normal variation (uniform surfaces)
 
         Args:
-            original_mesh: High-poly trimesh object
-            simplified_mesh: Simplified trimesh object
+            mesh: trimesh.Trimesh object
 
         Returns:
-            np.ndarray: Importance scores (0-1) for each face in original mesh
+            np.ndarray: Importance scores (0-1) for each face
         """
-        # Get face centroids
-        orig_centroids = original_mesh.triangles_center
-        simp_centroids = simplified_mesh.triangles_center
+        # Extract geometric features using FeatureExtractor
+        extractor = FeatureExtractor(mesh)
+        features = extractor.extract_all_features()
 
-        # For each original face, find distance to nearest simplified face
-        from scipy.spatial import cKDTree
-        tree = cKDTree(simp_centroids)
-        distances, indices = tree.query(orig_centroids)
+        # Get individual feature columns
+        # Feature order: gaussian_curv, mean_curv, area, aspect_ratio, max_dihedral,
+        #                min_dihedral, avg_valence, normal_var, edge_len_var, compactness, density
+        gaussian_curv = np.abs(features[:, 0])  # Absolute curvature
+        mean_curv = np.abs(features[:, 1])
+        face_area = features[:, 2]
+        max_dihedral = features[:, 4]  # Sharp edges (high = sharp)
+        normal_variation = features[:, 7]  # Surface detail
 
-        # Normalize distances
-        # Faces closer to simplified faces get higher importance
-        max_dist = distances.max()
-        if max_dist > 0:
-            # Inverse distance -> importance
-            importance = 1.0 - (distances / max_dist)
-        else:
-            importance = np.ones(len(orig_centroids))
+        # Percentile-based normalization to prevent outliers from compressing range
+        def percentile_normalize(arr, low=5, high=95):
+            p_low = np.percentile(arr, low)
+            p_high = np.percentile(arr, high)
+            if p_high - p_low > 1e-10:
+                normalized = (arr - p_low) / (p_high - p_low)
+                return np.clip(normalized, 0, 1)
+            return np.zeros_like(arr)
 
-        # Also consider if the simplified face normal matches
-        orig_normals = original_mesh.face_normals
-        simp_normals = simplified_mesh.face_normals
+        gaussian_norm = percentile_normalize(gaussian_curv)
+        mean_norm = percentile_normalize(mean_curv)
+        normal_var_norm = percentile_normalize(normal_variation)
+        area_norm = percentile_normalize(face_area)
 
-        # Dot product between original and nearest simplified normal
-        matched_normals = simp_normals[indices]
-        normal_similarity = np.sum(orig_normals * matched_normals, axis=1)
-        normal_similarity = np.clip(normal_similarity, 0, 1)
+        # Combine curvatures (both types indicate surface detail)
+        curvature_score = np.maximum(gaussian_norm, mean_norm)
 
-        # Combine distance and normal similarity
-        importance = importance * 0.5 + normal_similarity * 0.5
+        # Edge sharpness score (sharp dihedral = important feature edge)
+        # Convert from radians - angles > ~30 degrees are "sharp"
+        edge_score = np.clip((max_dihedral - 0.5) / 2.0, 0, 1)
+
+        # Penalize large flat faces (low curvature + large area = unimportant)
+        # Small faces in detailed areas are important even if individually flat
+        flatness_penalty = (1.0 - curvature_score) * area_norm * 0.5
+
+        # Final importance: weighted combination
+        # - Curvature is most important (50%)
+        # - Normal variation for surface detail (25%)
+        # - Edge sharpness (20%)
+        # - Flatness penalty (5%)
+        importance = (
+            curvature_score * 0.5 +
+            normal_var_norm * 0.25 +
+            edge_score * 0.2 +
+            (1.0 - flatness_penalty) * 0.05
+        )
+
+        # Ensure values are in [0, 1]
+        importance = np.clip(importance, 0, 1)
+
+        # Apply stronger sigmoid contrast to push values toward 0 and 1
+        # Steepness of 12 creates more separation than 8
+        importance = 1 / (1 + np.exp(-12 * (importance - 0.5)))
 
         return importance.astype(np.float32)
 
-    def generate_training_sample(self, mesh, target_ratio=0.2):
+    def generate_training_sample(self, mesh):
         """
         Generate a single training sample from a mesh.
 
         Args:
-            mesh: Original high-poly mesh
-            target_ratio: Target face count as ratio of original
+            mesh: trimesh.Trimesh object
 
         Returns:
             dict with features, labels, and metadata
@@ -378,40 +414,28 @@ class DatasetGenerator:
         if isinstance(mesh, trimesh.Scene):
             mesh = mesh.dump(concatenate=True)
 
-        original_faces = len(mesh.faces)
-        target_faces = max(int(original_faces * target_ratio), 50)
+        n_faces = len(mesh.faces)
 
-        # Extract features from original mesh
+        # Extract features from mesh
         extractor = FeatureExtractor(mesh)
         features = extractor.extract_all_features()
         normalized_features = extractor.normalize_features(features)
 
-        # Simplify mesh
-        try:
-            simplified = mesh.simplify_quadric_decimation(face_count=target_faces)
-        except Exception as e:
-            print(f"Simplification failed: {e}")
-            return None
-
-        # Compute importance labels
-        importance = self.compute_face_importance(mesh, simplified)
+        # Compute geometry-based importance labels
+        importance = self.compute_face_importance(mesh)
 
         return {
             'features': normalized_features,
             'importance': importance,
-            'original_faces': original_faces,
-            'simplified_faces': len(simplified.faces),
-            'target_ratio': target_ratio,
+            'n_faces': n_faces,
         }
 
-    def generate_dataset(self, num_meshes=100, ratios=[0.1, 0.2, 0.3, 0.5],
-                         use_thingi10k=False, thingi10k_ratio=0.5):
+    def generate_dataset(self, num_meshes=100, use_thingi10k=False, thingi10k_ratio=0.5):
         """
         Generate a full training dataset.
 
         Args:
             num_meshes: Total number of unique meshes to use
-            ratios: List of simplification ratios to use for each mesh
             use_thingi10k: Whether to use Thingi10K meshes
             thingi10k_ratio: Ratio of meshes from Thingi10K (rest synthetic)
 
@@ -449,15 +473,17 @@ class DatasetGenerator:
 
             all_meshes = organic_meshes + hard_meshes
 
-        print(f"\nProcessing {len(all_meshes)} meshes with {len(ratios)} ratios each...")
+        print(f"\nProcessing {len(all_meshes)} meshes...")
 
         for i, mesh in enumerate(all_meshes):
-            for ratio in ratios:
-                sample = self.generate_training_sample(mesh, target_ratio=ratio)
+            try:
+                sample = self.generate_training_sample(mesh)
                 if sample is not None:
                     sample['mesh_id'] = i
-                    sample['ratio_id'] = ratios.index(ratio)
                     samples.append(sample)
+            except Exception as e:
+                print(f"  Failed to process mesh {i}: {e}")
+                continue
 
             if (i + 1) % 10 == 0:
                 print(f"  Processed {i + 1}/{len(all_meshes)} meshes")
@@ -508,8 +534,6 @@ def main():
                         help="Number of meshes to use")
     parser.add_argument("--output", type=str, default="data",
                         help="Output directory")
-    parser.add_argument("--ratios", type=float, nargs="+", default=[0.1, 0.2, 0.3, 0.5],
-                        help="Simplification ratios to use")
     parser.add_argument("--thingi10k", type=str, default=None,
                         help="Path to Thingi10K dataset directory")
     parser.add_argument("--thingi10k_ratio", type=float, default=0.7,
@@ -535,7 +559,7 @@ def main():
     print("Mesh Retopology ML - Dataset Generator")
     print("=" * 50)
     print(f"Target meshes: {args.num_meshes}")
-    print(f"Simplification ratios: {args.ratios}")
+    print(f"Labeling: Geometry-based (curvature, edges, normal variation)")
     print(f"Output directory: {args.output}")
     if use_thingi10k:
         print(f"Thingi10K directory: {thingi10k_dir}")
@@ -546,7 +570,6 @@ def main():
 
     samples = generator.generate_dataset(
         num_meshes=args.num_meshes,
-        ratios=args.ratios,
         use_thingi10k=use_thingi10k,
         thingi10k_ratio=args.thingi10k_ratio
     )
