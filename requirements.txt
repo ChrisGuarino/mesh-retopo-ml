@@ -6,3 +6,8 @@ networkx
 pyfqmr
 "pyglet<2"
 torch
+torchvision
+pyrender
+opencv-python
+tqdm
+Pillow
